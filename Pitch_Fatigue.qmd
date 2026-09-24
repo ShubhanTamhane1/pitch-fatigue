@@ -1,0 +1,429 @@
+---
+title: "Pitch Fatigue"
+format: html
+---
+
+## Setup
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+```
+
+## Load All Games
+
+```{python}
+df_2_17 = pd.read_csv("/Users/shubhantamhane/proposal-latex-repo-ShubhanTamhane1/data/UConn_v_Arizona_State_2.17.csv")
+df_2_19 = pd.read_csv("/Users/shubhantamhane/proposal-latex-repo-ShubhanTamhane1/data/UConn_v_Arizona_2.19.csv")
+df_2_20 = pd.read_csv("/Users/shubhantamhane/proposal-latex-repo-ShubhanTamhane1/data/UConn_v_Arizona_2.20.csv")
+df_2_21 = pd.read_csv("/Users/shubhantamhane/proposal-latex-repo-ShubhanTamhane1/data/UConn_v_Arizona_2.21.csv")
+df_2_22 = pd.read_csv("/Users/shubhantamhane/proposal-latex-repo-ShubhanTamhane1/data/UConn_v_Arizona_2.22.csv")
+
+df_2_17["GameID"] = "2_17"
+df_2_19["GameID"] = "2_19"
+df_2_20["GameID"] = "2_20"
+df_2_21["GameID"] = "2_21"
+df_2_22["GameID"] = "2_22"
+
+data_all = pd.concat(
+    [df_2_17, df_2_19, df_2_20, df_2_21, df_2_22],
+    ignore_index=True
+)
+
+game_order = {"2_17": 1, "2_19": 2, "2_20": 3, "2_21": 4, "2_22": 5}
+data_all["GameNumber"] = data_all["GameID"].map(game_order)
+```
+
+```{python}
+data_all.to_csv("baseball_final_data.csv")
+```
+
+## Inspect Columns and Pitch Types
+
+```{python}
+print(data_all.columns.tolist())
+print(data_all["TaggedPitchType"].value_counts())
+```
+
+## Prepare data_all (All Games)
+
+```{python}
+data_all = data_all.sort_values(["GameNumber", "Pitcher", "PitchNo"]).copy()
+
+data_all["PitchCount"]     = data_all.groupby(["GameID", "Pitcher"])["PitchNo"].rank(method="first")
+data_all["TotalPitches"]   = data_all.groupby(["GameID", "Pitcher"])["PitchNo"].transform("count")
+data_all["BaselineCutoff"] = np.ceil(data_all["TotalPitches"] * 0.20)
+data_all["IsBaseline"]     = data_all["PitchCount"] <= data_all["BaselineCutoff"]
+```
+
+## Prepare data (Most Recent Game Only)
+
+```{python}
+data = data_all[data_all["GameID"] == "2_22"].copy()
+data = data.sort_values(["Pitcher", "PitchNo"]).copy()
+```
+
+## Baseline Function
+
+```{python}
+def add_baselines(df):
+    baseline = (
+        df[df["IsBaseline"]]
+        .groupby(["GameID", "Pitcher", "TaggedPitchType"])
+        .agg({
+            "RelSpeed": "mean",
+            "SpinRate": "mean",
+            "InducedVertBreak": "mean",
+            "EffectiveVelo": "mean",
+            "HorzBreak": "mean",
+            "PlateLocHeight": "mean",
+            "PlateLocSide": "mean",
+            "Extension": "mean"
+        })
+        .rename(columns={
+            "RelSpeed": "BaselineVelo",
+            "SpinRate": "BaselineSpin",
+            "InducedVertBreak": "BaselineIVB",
+            "EffectiveVelo": "BaselineEffectiveVelo",
+            "HorzBreak": "BaselineHorzBreak",
+            "PlateLocHeight": "BaselinePlateHeight",
+            "PlateLocSide": "BaselinePlateSide",
+            "Extension": "BaselineExtension"
+        })
+        .reset_index()
+    )
+    return df.merge(baseline, on=["GameID", "Pitcher", "TaggedPitchType"], how="left")
+```
+
+## Add Baselines
+
+```{python}
+data_all = add_baselines(data_all)
+data     = add_baselines(data)
+```
+
+## Compute Deviation Features
+
+```{python}
+for df in [data_all, data]:
+    df["VeloDev"]          = df["RelSpeed"]         - df["BaselineVelo"]
+    df["SpinDev"]          = df["SpinRate"]          - df["BaselineSpin"]
+    df["IVBDev"]           = df["InducedVertBreak"]  - df["BaselineIVB"]
+    df["EffectiveVeloDev"] = df["EffectiveVelo"]     - df["BaselineEffectiveVelo"]
+    df["HorzBreakDev"]     = df["HorzBreak"]         - df["BaselineHorzBreak"]
+    df["PlateHeightDev"]   = df["PlateLocHeight"]    - df["BaselinePlateHeight"]
+    df["PlateSideDev"]     = df["PlateLocSide"]      - df["BaselinePlateSide"]
+    df["ExtensionDev"]     = df["Extension"]         - df["BaselineExtension"]
+```
+
+## Quick Check of Fatigue Variables (Most Recent Game)
+
+```{python}
+data[[
+    "VeloDev", "SpinDev", "IVBDev",
+    "EffectiveVeloDev", "HorzBreakDev",
+    "PlateHeightDev", "PlateSideDev", "ExtensionDev"
+]].describe()
+```
+
+## Overall Velocity Deviation: Most Recent Game (All Pitchers)
+
+```{python}
+plt.figure(figsize=(8, 5))
+plt.scatter(data["PitchCount"], data["VeloDev"], alpha=0.25)
+plt.axhline(0, color="red")
+plt.xlabel("Pitch Count")
+plt.ylabel("Velocity Deviation")
+plt.title("Velocity Deviation From Baseline: All Pitches (2/22)")
+plt.show()
+```
+
+## Binned Average Velocity Deviation: Most Recent Game
+
+```{python}
+plot_data = data.dropna(subset=["PitchCount", "VeloDev"]).copy()
+plot_data["PitchBin"] = pd.cut(plot_data["PitchCount"], bins=10)
+
+bin_means = plot_data.groupby("PitchBin", observed=False)["VeloDev"].mean()
+bin_centers = [interval.mid for interval in bin_means.index]
+
+plt.figure(figsize=(8, 5))
+plt.scatter(plot_data["PitchCount"], plot_data["VeloDev"], alpha=0.15)
+plt.plot(bin_centers, bin_means.values, linewidth=3)
+plt.axhline(0, color="red")
+plt.xlabel("Pitch Count")
+plt.ylabel("Velocity Deviation")
+plt.title("Average Velocity Deviation by Pitch Count Bin (2/22)")
+plt.show()
+```
+
+## Filter to Fastballs (All Games)
+
+```{python}
+fastballs = data_all[data_all["TaggedPitchType"] == "Fastball"].copy()
+fastballs = fastballs.sort_values(["Pitcher", "GameID", "PitchCount"]).copy()
+print(fastballs["Pitcher"].dropna().unique())
+```
+
+## Reusable Plotting Function
+
+```{python}
+def plot_binned_feature(df, feature_col, y_label, title, bins=8):
+    plot_df = df.dropna(subset=["PitchCount", feature_col]).copy()
+    plot_df["PitchBin"] = pd.cut(plot_df["PitchCount"], bins=bins)
+
+    bin_means = plot_df.groupby("PitchBin", observed=False)[feature_col].mean()
+    bin_centers = [interval.mid for interval in bin_means.index]
+
+    plt.figure(figsize=(8, 5))
+    plt.scatter(plot_df["PitchCount"], plot_df[feature_col], alpha=0.30)
+    plt.plot(bin_centers, bin_means.values, linewidth=3)
+    plt.axhline(0, color="red")
+    plt.xlabel("Pitch Count")
+    plt.ylabel(y_label)
+    plt.title(title)
+    plt.show()
+```
+
+## Select One Pitcher and One Outing
+
+```{python}
+pitcher_name = "Pudvar, Oliver"
+
+one_pitcher = fastballs[fastballs["Pitcher"] == pitcher_name].copy()
+print(one_pitcher["GameID"].unique())
+
+game_id = one_pitcher["GameID"].iloc[0]
+one_pitcher_game = one_pitcher[one_pitcher["GameID"] == game_id].sort_values("PitchCount").copy()
+```
+
+## Plot Fastball Fatigue Features for One Pitcher
+
+### Velocity
+
+```{python}
+plot_binned_feature(one_pitcher_game, "VeloDev", "Velocity Deviation",
+                    f"Fastball Velocity Deviation: {pitcher_name}")
+```
+
+### Spin Rate
+
+```{python}
+plot_binned_feature(one_pitcher_game, "SpinDev", "Spin Rate Deviation",
+                    f"Fastball Spin Rate Deviation: {pitcher_name}")
+```
+
+### Induced Vertical Break
+
+```{python}
+plot_binned_feature(one_pitcher_game, "IVBDev", "IVB Deviation",
+                    f"Fastball IVB Deviation: {pitcher_name}")
+```
+
+### Horizontal Break
+
+```{python}
+plot_binned_feature(one_pitcher_game, "HorzBreakDev", "Horizontal Break Deviation",
+                    f"Fastball Horizontal Break Deviation: {pitcher_name}")
+```
+
+### Extension
+
+```{python}
+plot_binned_feature(one_pitcher_game, "ExtensionDev", "Extension Deviation",
+                    f"Fastball Extension Deviation: {pitcher_name}")
+```
+
+## OLS Slope Test: Velocity Fatigue Per Pitcher Per Game
+
+```{python}
+summary = []
+
+for (pitcher, game), df in fastballs.groupby(["Pitcher", "GameID"]):
+    df = df.dropna(subset=["PitchCount", "VeloDev"])
+    if len(df) < 10:
+        continue
+
+    X = sm.add_constant(df["PitchCount"])
+    model = sm.OLS(df["VeloDev"], X).fit()
+
+    cutoff = np.percentile(df["PitchCount"], 80)
+    late = df[df["PitchCount"] >= cutoff]
+
+    summary.append({
+        "Pitcher": pitcher,
+        "GameID": game,
+        "Slope": model.params["PitchCount"],
+        "p_value": model.pvalues["PitchCount"],
+        "LateGameVeloDev": late["VeloDev"].mean(),
+        "NumPitches": len(df)
+    })
+
+summary_df = pd.DataFrame(summary)
+summary_df["GameNumber"] = summary_df["GameID"].map(game_order)
+summary_df = summary_df.sort_values("Slope")
+
+print(summary_df.shape)
+print(summary_df.describe())
+summary_df
+```
+
+## Fatigue Slope Across Games
+
+```{python}
+plt.figure(figsize=(8, 5))
+plt.scatter(summary_df["GameNumber"], summary_df["Slope"])
+plt.axhline(0, color="red")
+plt.xlabel("Game Number")
+plt.ylabel("Velocity Decline Slope")
+plt.title("Fatigue Across Games")
+plt.show()
+```
+
+```{python}
+game_summary = (
+    summary_df
+    .groupby("GameNumber")
+    .agg(
+        AvgSlope=("Slope", "mean"),
+        StdSlope=("Slope", "std"),
+        Count=("Slope", "count")
+    )
+    .reset_index()
+)
+
+game_summary
+```
+
+```{python}
+plt.figure(figsize=(8,5))
+
+plt.plot(
+    game_summary["GameNumber"],
+    game_summary["AvgSlope"],
+    marker="o",
+    linewidth=2
+)
+
+plt.axhline(0)
+plt.xlabel("Game Number")
+plt.ylabel("Average Velocity Decline Slope")
+plt.title("Average Fatigue Across Games")
+
+plt.show()
+```
+
+```{python}
+X = sm.add_constant(summary_df["GameNumber"])
+y = summary_df["Slope"]
+
+model = sm.OLS(y, X).fit()
+print(model.summary())
+```
+
+## Composite Fatigue Score
+
+```{python}
+fatigue_features = ["VeloDev", "SpinDev", "IVBDev", "EffectiveVeloDev", "ExtensionDev"]
+
+fatigue_df = data_all.dropna(subset=fatigue_features).copy()
+
+for col in fatigue_features:
+    fatigue_df[col + "_z"] = (
+        fatigue_df[col] - fatigue_df[col].mean()
+    ) / fatigue_df[col].std()
+
+fatigue_df["FatigueScore"] = -fatigue_df[[col + "_z" for col in fatigue_features]].mean(axis=1)
+
+plot_binned_feature(
+    fatigue_df,
+    "FatigueScore",
+    "Composite Fatigue Score",
+    "Composite Fatigue Score Across Games"
+)
+```
+
+```{python}
+summary_df["AvgFatigueScore"] = summary_df["GameID"].map(
+    fatigue_df.groupby("GameID")["FatigueScore"].mean()
+)
+```
+
+## Outcome based Logistic Regression
+
+```{python}
+data_all["Ineffective"] = data_all["PitchCall"].isin(["BallCalled"]).astype(int)
+
+features = ["VeloDev", "SpinDev", "IVBDev", "EffectiveVeloDev", "HorzBreakDev", "ExtensionDev", "PitchCount"]
+model_df = data_all.dropna(subset=features + ["Ineffective"])
+
+X = model_df[features]
+y = model_df["Ineffective"]
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, roc_auc_score, ConfusionMatrixDisplay
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+clf = LogisticRegression(max_iter=1000, class_weight='balanced')
+clf.fit(X_train, y_train)
+```
+
+```{python}
+print(classification_report(y_test, clf.predict(X_test)))
+print("ROC-AUC:", roc_auc_score(y_test, clf.predict_proba(X_test)[:,1]))
+ConfusionMatrixDisplay.from_estimator(clf, X_test, y_test)
+plt.show()
+
+coef_df = pd.DataFrame({"Feature": features, "Coefficient": clf.coef_[0]}).sort_values("Coefficient")
+coef_df.plot(kind="barh", x="Feature", y="Coefficient", legend=False)
+plt.axvline(0, color="red")
+plt.title("Logistic Regression Coefficients")
+plt.show()
+```
+
+## Threshold based Logistic Regression 
+
+```{python}
+data_all["Ineffective"] = (data_all["VeloDev"] < -1).astype(int)
+
+print(data_all["Ineffective"].value_counts())
+print(data_all["Ineffective"].value_counts(normalize=True).round(2))
+
+features = ["SpinDev", "IVBDev", "EffectiveVeloDev", "HorzBreakDev", "ExtensionDev", "PitchCount"]
+model_df = data_all.dropna(subset=features + ["Ineffective"])
+
+X = model_df[features]
+y = model_df["Ineffective"]
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, roc_auc_score, ConfusionMatrixDisplay
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+clf = LogisticRegression(max_iter=1000, class_weight='balanced')
+clf.fit(X_train, y_train)
+```
+
+```{python}
+print(classification_report(y_test, clf.predict(X_test)))
+print("ROC-AUC:", roc_auc_score(y_test, clf.predict_proba(X_test)[:,1]))
+ConfusionMatrixDisplay.from_estimator(clf, X_test, y_test)
+plt.show()
+
+coef_df = pd.DataFrame({"Feature": features, "Coefficient": clf.coef_[0]}).sort_values("Coefficient")
+coef_df.plot(kind="barh", x="Feature", y="Coefficient", legend=False)
+plt.axvline(0, color="red")
+plt.title("Logistic Regression Coefficients")
+plt.show()
+```
+
+```{python}
+print(f"Pitchers: {model_df['Pitcher'].nunique()}")
+print(f"Total pitches: {len(model_df)}")
+print(f"Games: {model_df['GameID'].nunique()}")
+```

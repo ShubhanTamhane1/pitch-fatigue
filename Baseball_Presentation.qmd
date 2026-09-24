@@ -1,0 +1,418 @@
+---
+title: "Detecting Pitcher Fatigue"
+subtitle: "A Biomechanical Deviation Approach Using TrackMan Data"
+author: "Shubhan Tamhane"
+format:
+  revealjs:
+    theme: dark
+    transition: slide
+    slide-number: true
+    fig-align: center
+    footer: "UConn Baseball Analytics"
+    scrollable: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Motivation
+
+::: {.incremental}
+- Pitcher fatigue is one of the **hardest things to quantify** in baseball
+- Coaches rely on pitch count and gut feel — but when does performance actually decline?
+- TrackMan pitch-tracking data gives us a window into **biomechanical changes pitch-by-pitch**
+- Can we detect fatigue **before** it becomes visible to the naked eye?
+:::
+
+---
+
+## Research Question
+
+::: {.r-fit-text}
+Can biomechanical deviations from a  
+pitcher's personal baseline predict  
+velocity decline within a game?
+:::
+
+---
+
+## Data
+
+- **5 games** from UConn's February series vs. Arizona (2/17 – 2/22)
+- TrackMan pitch-tracking data with full biomechanical output
+
+| Variable | Description |
+|---|---|
+| `RelSpeed` | Release velocity (mph) |
+| `SpinRate` | Spin rate (rpm) |
+| `InducedVertBreak` | Vertical movement (in) |
+| `HorzBreak` | Horizontal movement (in) |
+| `Extension` | Release extension (ft) |
+| `EffectiveVelo` | Perceived velocity at plate |
+
+---
+
+## Methodology: Personalized Baselines
+
+Rather than league averages, we build a **per-pitcher, per-game, per-pitch-type** baseline
+
+```python
+# First 20% of each pitcher's outing = baseline window
+data_all["BaselineCutoff"] = np.ceil(data_all["TotalPitches"] * 0.20)
+data_all["IsBaseline"]     = data_all["PitchCount"] <= data_all["BaselineCutoff"]
+```
+
+::: {.callout-note}
+This accounts for natural variation across pitchers and pitch types — 
+a 90 mph fastball for one pitcher is not the same as 90 mph for another.
+:::
+
+---
+
+## Deviation Features
+
+For each pitch, we compute deviation from that pitcher's baseline:
+
+$$\text{VeloDev} = \text{RelSpeed} - \text{BaselineVelo}$$
+
+We compute this for **8 biomechanical features**:
+
+`VeloDev` · `SpinDev` · `IVBDev` · `EffectiveVeloDev`  
+`HorzBreakDev` · `PlateHeightDev` · `PlateSideDev` · `ExtensionDev`
+
+> Negative values = below personal baseline = potential fatigue signal
+
+---
+
+## Setup
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, roc_auc_score, ConfusionMatrixDisplay
+
+df_2_17 = pd.read_csv("/Users/shubhantamhane/proposal-latex-repo-ShubhanTamhane1/data/UConn_v_Arizona_State_2.17.csv")
+df_2_19 = pd.read_csv("/Users/shubhantamhane/proposal-latex-repo-ShubhanTamhane1/data/UConn_v_Arizona_2.19.csv")
+df_2_20 = pd.read_csv("/Users/shubhantamhane/proposal-latex-repo-ShubhanTamhane1/data/UConn_v_Arizona_2.20.csv")
+df_2_21 = pd.read_csv("/Users/shubhantamhane/proposal-latex-repo-ShubhanTamhane1/data/UConn_v_Arizona_2.21.csv")
+df_2_22 = pd.read_csv("/Users/shubhantamhane/proposal-latex-repo-ShubhanTamhane1/data/UConn_v_Arizona_2.22.csv")
+
+for df, gid in zip([df_2_17,df_2_19,df_2_20,df_2_21,df_2_22],["2_17","2_19","2_20","2_21","2_22"]):
+    df["GameID"] = gid
+
+game_order = {"2_17":1,"2_19":2,"2_20":3,"2_21":4,"2_22":5}
+data_all = pd.concat([df_2_17,df_2_19,df_2_20,df_2_21,df_2_22], ignore_index=True)
+data_all["GameNumber"] = data_all["GameID"].map(game_order)
+data_all = data_all.sort_values(["GameNumber","Pitcher","PitchNo"]).copy()
+data_all["PitchCount"]     = data_all.groupby(["GameID","Pitcher"])["PitchNo"].rank(method="first")
+data_all["TotalPitches"]   = data_all.groupby(["GameID","Pitcher"])["PitchNo"].transform("count")
+data_all["BaselineCutoff"] = np.ceil(data_all["TotalPitches"] * 0.20)
+data_all["IsBaseline"]     = data_all["PitchCount"] <= data_all["BaselineCutoff"]
+
+def add_baselines(df):
+    baseline = (
+        df[df["IsBaseline"]]
+        .groupby(["GameID","Pitcher","TaggedPitchType"])
+        .agg({"RelSpeed":"mean","SpinRate":"mean","InducedVertBreak":"mean",
+              "EffectiveVelo":"mean","HorzBreak":"mean","PlateLocHeight":"mean",
+              "PlateLocSide":"mean","Extension":"mean"})
+        .rename(columns={"RelSpeed":"BaselineVelo","SpinRate":"BaselineSpin",
+                         "InducedVertBreak":"BaselineIVB","EffectiveVelo":"BaselineEffectiveVelo",
+                         "HorzBreak":"BaselineHorzBreak","PlateLocHeight":"BaselinePlateHeight",
+                         "PlateLocSide":"BaselinePlateSide","Extension":"BaselineExtension"})
+        .reset_index()
+    )
+    return df.merge(baseline, on=["GameID","Pitcher","TaggedPitchType"], how="left")
+
+data_all = add_baselines(data_all)
+data_all["VeloDev"]          = data_all["RelSpeed"]          - data_all["BaselineVelo"]
+data_all["SpinDev"]          = data_all["SpinRate"]          - data_all["BaselineSpin"]
+data_all["IVBDev"]           = data_all["InducedVertBreak"]  - data_all["BaselineIVB"]
+data_all["EffectiveVeloDev"] = data_all["EffectiveVelo"]     - data_all["BaselineEffectiveVelo"]
+data_all["HorzBreakDev"]     = data_all["HorzBreak"]         - data_all["BaselineHorzBreak"]
+data_all["PlateHeightDev"]   = data_all["PlateLocHeight"]    - data_all["BaselinePlateHeight"]
+data_all["PlateSideDev"]     = data_all["PlateLocSide"]      - data_all["BaselinePlateSide"]
+data_all["ExtensionDev"]     = data_all["Extension"]         - data_all["BaselineExtension"]
+
+fastballs = data_all[data_all["TaggedPitchType"] == "Fastball"].copy()
+fastballs = fastballs.sort_values(["Pitcher","GameID","PitchCount"]).copy()
+
+def plot_binned_feature(df, feature_col, y_label, title, bins=8):
+    plot_df = df.dropna(subset=["PitchCount", feature_col]).copy()
+    plot_df["PitchBin"] = pd.cut(plot_df["PitchCount"], bins=bins)
+    bin_means = plot_df.groupby("PitchBin", observed=False)[feature_col].mean()
+    bin_centers = [interval.mid for interval in bin_means.index]
+    plt.figure(figsize=(9,5))
+    plt.scatter(plot_df["PitchCount"], plot_df[feature_col], alpha=0.30)
+    plt.plot(bin_centers, bin_means.values, linewidth=3)
+    plt.axhline(0, color="red")
+    plt.xlabel("Pitch Count")
+    plt.ylabel(y_label)
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+```
+
+---
+
+## Velocity Deviation Across Pitch Count
+
+```{python}
+plot_data = data_all.dropna(subset=["PitchCount","VeloDev"]).copy()
+plot_data["PitchBin"] = pd.cut(plot_data["PitchCount"], bins=10)
+bin_means = plot_data.groupby("PitchBin", observed=False)["VeloDev"].mean()
+bin_centers = [interval.mid for interval in bin_means.index]
+
+plt.figure(figsize=(9,5))
+plt.scatter(plot_data["PitchCount"], plot_data["VeloDev"], alpha=0.15)
+plt.plot(bin_centers, bin_means.values, linewidth=3)
+plt.axhline(0, color="red")
+plt.xlabel("Pitch Count")
+plt.ylabel("Velocity Deviation (mph)")
+plt.title("Average Velocity Deviation by Pitch Count — All Games")
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Case Study: Oliver Pudvar
+
+```{python}
+pitcher_name = "Pudvar, Oliver"
+one_pitcher = fastballs[fastballs["Pitcher"] == pitcher_name].copy()
+game_id = one_pitcher["GameID"].iloc[0]
+one_pitcher_game = one_pitcher[one_pitcher["GameID"] == game_id].sort_values("PitchCount").copy()
+
+plot_binned_feature(one_pitcher_game, "VeloDev", "Velocity Deviation",
+                    f"Fastball Velocity Deviation: {pitcher_name}")
+```
+
+---
+
+## OLS: Is Velocity Decline Statistically Significant?
+
+For each pitcher-game pair:
+
+$$\text{VeloDev}_i = \beta_0 + \beta_1 \cdot \text{PitchCount}_i + \varepsilon_i$$
+
+```{python}
+summary = []
+for (pitcher, game), df in fastballs.groupby(["Pitcher","GameID"]):
+    df = df.dropna(subset=["PitchCount","VeloDev"])
+    if len(df) < 10:
+        continue
+    X = sm.add_constant(df["PitchCount"])
+    model = sm.OLS(df["VeloDev"], X).fit()
+    cutoff = np.percentile(df["PitchCount"], 80)
+    late = df[df["PitchCount"] >= cutoff]
+    summary.append({"Pitcher":pitcher, "GameID":game,
+                    "Slope":round(model.params["PitchCount"], 4),
+                    "p_value":round(model.pvalues["PitchCount"], 4),
+                    "Significant (p<0.05)": "✓" if model.pvalues["PitchCount"] < 0.05 else "",
+                    "LateGameVeloDev":round(late["VeloDev"].mean(), 3),
+                    "NumPitches":len(df)})
+
+summary_df = pd.DataFrame(summary)
+summary_df["GameNumber"] = summary_df["GameID"].map(game_order)
+summary_df_sorted = summary_df.sort_values("Slope")
+
+display_cols = ["Pitcher","GameID","Slope","p_value","Significant (p<0.05)","LateGameVeloDev","NumPitches"]
+summary_df_sorted[display_cols].style.set_properties(**{"font-size":"12px"})
+```
+
+---
+
+## Fatigue Slope Across Games
+
+```{python}
+game_summary = (
+    summary_df.groupby("GameNumber")
+    .agg(AvgSlope=("Slope","mean"), StdSlope=("Slope","std"), Count=("Slope","count"))
+    .reset_index()
+)
+
+plt.figure(figsize=(9,5))
+plt.plot(game_summary["GameNumber"], game_summary["AvgSlope"], marker="o", linewidth=2)
+plt.axhline(0, color="red")
+plt.xlabel("Game Number")
+plt.ylabel("Average Velocity Decline Slope")
+plt.title("Average Fatigue Slope Across Games")
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## OLS: Fatigue Compounds Across the Series
+
+```{python}
+X_game = sm.add_constant(summary_df["GameNumber"])
+y_game = summary_df["Slope"]
+game_model = sm.OLS(y_game, X_game).fit()
+print(game_model.summary())
+```
+
+---
+
+## Approach 1: Outcome-Based Target
+
+**First attempt:** label a pitch as ineffective if it resulted in a ball call
+
+$$y = \mathbf{1}[\text{PitchCall} = \text{"BallCalled"}]$$
+
+**Features:** `VeloDev` · `SpinDev` · `IVBDev` · `EffectiveVeloDev` · `HorzBreakDev` · `ExtensionDev` · `PitchCount`
+
+**Model:** Logistic Regression with `class_weight='balanced'`
+
+---
+
+## Approach 1: Results
+
+```{python}
+data_all["Ineffective_outcome"] = (data_all["PitchCall"] == "BallCalled").astype(int)
+features_v1 = ["VeloDev","SpinDev","IVBDev","EffectiveVeloDev","HorzBreakDev","ExtensionDev","PitchCount"]
+model_df_v1 = data_all.dropna(subset=features_v1 + ["Ineffective_outcome"])
+X_v1 = model_df_v1[features_v1]
+y_v1 = model_df_v1["Ineffective_outcome"]
+
+X_train1, X_test1, y_train1, y_test1 = train_test_split(X_v1, y_v1, test_size=0.2, random_state=42)
+clf_v1 = LogisticRegression(max_iter=1000, class_weight="balanced")
+clf_v1.fit(X_train1, y_train1)
+
+auc_v1 = roc_auc_score(y_test1, clf_v1.predict_proba(X_test1)[:,1])
+
+fig, ax = plt.subplots(figsize=(6,5))
+ConfusionMatrixDisplay.from_estimator(clf_v1, X_test1, y_test1, ax=ax)
+plt.title(f"Outcome-Based Target | ROC-AUC: {auc_v1:.3f}")
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Approach 1: Why It Fell Short
+
+::: {.incremental}
+- **ROC-AUC ≈ 0.56** — barely better than a coin flip
+- A ball call is a **noisy proxy** for fatigue:
+  - Intentional pitches off the zone
+  - Catcher framing misses
+  - Close takes unrelated to pitcher mechanics
+- The label has too much noise for biomechanical deviations to overcome
+- We need a **cleaner, more direct** definition of fatigue
+:::
+
+---
+
+## Approach 2: Threshold-Based Target
+
+**Insight:** instead of predicting an umpire's call, directly predict **velocity decline**
+
+$$y = \mathbf{1}[\text{VeloDev} < -1 \text{ mph}]$$
+
+
+`SpinDev` · `IVBDev` · `EffectiveVeloDev` · `HorzBreakDev` · `ExtensionDev` · `PitchCount`
+
+::: {.callout-note}
+The question becomes: **can other biomechanical signals predict when velocity tanks?**
+:::
+
+---
+
+## Approach 2: Results
+
+```{python}
+data_all["Ineffective"] = (data_all["VeloDev"] < -1).astype(int)
+features_v2 = ["SpinDev","IVBDev","EffectiveVeloDev","HorzBreakDev","ExtensionDev","PitchCount"]
+model_df_v2 = data_all.dropna(subset=features_v2 + ["Ineffective"])
+X_v2 = model_df_v2[features_v2]
+y_v2 = model_df_v2["Ineffective"]
+
+X_train2, X_test2, y_train2, y_test2 = train_test_split(X_v2, y_v2, test_size=0.2, random_state=42)
+clf_v2 = LogisticRegression(max_iter=1000, class_weight="balanced")
+clf_v2.fit(X_train2, y_train2)
+
+auc_v2 = roc_auc_score(y_test2, clf_v2.predict_proba(X_test2)[:,1])
+
+fig, ax = plt.subplots(figsize=(6,5))
+ConfusionMatrixDisplay.from_estimator(clf_v2, X_test2, y_test2, ax=ax)
+plt.title(f"Threshold-Based Target | ROC-AUC: {auc_v2:.3f}")
+plt.tight_layout()
+plt.show()
+```
+
+**Accuracy: 90% · Recall (fatigue): 92% · ROC-AUC: 0.976**
+
+---
+
+## Approach 2: Coefficient Plot
+
+```{python}
+coef_df = pd.DataFrame({"Feature":features_v2,"Coefficient":clf_v2.coef_[0]}).sort_values("Coefficient")
+fig, ax = plt.subplots(figsize=(9,5))
+ax.barh(coef_df["Feature"], coef_df["Coefficient"])
+ax.axvline(0, color="red")
+ax.set_title("Logistic Regression Coefficients — Threshold Target")
+ax.set_xlabel("Coefficient")
+plt.tight_layout()
+plt.show()
+```
+
+::: {.incremental}
+- **EffectiveVeloDev** strongly negative — perceived velocity drop predicts actual velocity loss
+- **ExtensionDev** positive — possible overextension compensation mechanism when fatigued
+- SpinDev, IVBDev, PitchCount add minimal independent signal
+:::
+
+---
+
+## Comparing the Two Approaches
+
+| | Outcome-Based | Threshold-Based |
+|---|---|---|
+| **Target** | Ball call | VeloDev < −1 mph |
+| **ROC-AUC** | 0.56 | 0.976 |
+| **Recall (fatigue)** | 59% | 92% |
+| **Key issue** | Noisy label | Clean, direct signal |
+
+
+
+---
+
+## Future Directions
+
+::: {.incremental}
+- Expand to **full season** of TrackMan data
+- Use richer target: **run value per pitch** or exit velocity allowed
+- Apply **Random Forest / XGBoost** on larger dataset
+- Build a **real-time in-game fatigue index** for coaching use
+- Explore **cross-game fatigue accumulation** between starts
+:::
+
+---
+
+## Summary
+
+::: {.r-fit-text}
+Biomechanical deviations from a  
+personal baseline predict velocity  
+decline with **AUC = 0.976**
+:::
+
+Choosing a clean, direct target variable  
+was the key methodological insight
+
+---
+
+## Thank You
+
+**Shubhan Tamhane**  
+UConn Baseball Analytics · STAT 4916W
+
+*Data: TrackMan · February 2024 Series*
